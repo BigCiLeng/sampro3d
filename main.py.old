@@ -19,12 +19,11 @@ from tqdm import tqdm
 from utils.sam_utils import *
 from utils.main_utils import *
 from utils.vis_utils import *
-from pathlib import Path
 from segment_anything import sam_model_registry, SamPredictor
 
 
 # 2D-Guided Prompt Filter:
-def prompt_filter(init_prompt, scene_output_path, npy_path, mask_threshold, args):
+def prompt_filter(init_prompt, scene_output_path, npy_path, predictor, args):
     device = torch.device(args.device)
     # gap = 1  # number of skipped frames
     stop_limit = 10  # we find that not considering all frames for filter is better
@@ -72,7 +71,7 @@ def prompt_filter(init_prompt, scene_output_path, npy_path, mask_threshold, args
     #     print(data['points'].shape)
         
         # Threshold masks and calculate boxes
-        data["masks"] = data["masks"] > mask_threshold
+        data["masks"] = data["masks"] > predictor.model.mask_threshold
         data["boxes"] = batched_mask_to_box(data["masks"])
         data["rles"] = mask_to_rle_pytorch(data["masks"])
         
@@ -133,7 +132,7 @@ def perform_3dsegmentation(xyz, keep_idx, scene_output_path, npy_path, args):
         frame_id = npy_file[:-4]
 
         # calculate the 3d-2d mapping on ALL input points (not just prompt)
-        mapping = compute_mapping(xyz, args.data_path, frame_id)
+        mapping = compute_mapping(xyz, args.data_path, args.scene_name, frame_id)
         if mapping[:, 2].sum() == 0: # no points corresponds to this image, skip
             print("# no points corresponds to this image, skip")
             continue
@@ -281,7 +280,15 @@ def get_args():
 
     parser = argparse.ArgumentParser()
     # path arguments:
-    parser.add_argument('--data_path', default="/data/luoly/dataset/assist/530_scannet_table0_copy", type=Path, help='Path to the dataset containing ScanNet 2d frames and 3d .ply files.')
+    parser.add_argument('--data_path', default="dataset/scannet", type=str, help='Path to the dataset containing ScanNet 2d frames and 3d .ply files.')
+    parser.add_argument('--scene_name', default="scene0030_00", type=str, help='The scene names in ScanNet.')
+    parser.add_argument('--prompt_path', default="init_prompt", type=str, help='Path to the pre-sampled 3D initial prompts.')
+    parser.add_argument('--sam_output_path', default="sam_output", type=str, help='Path to the previously generated sam segmentation result.')
+    parser.add_argument('--pred_path', default="final_pred", type=str, help='Path to save the predicted per-point segmentation.')
+    parser.add_argument('--output_vis_path', default="output_vis", type=str, help='Path to save the visualization file of the final segmentation result.')
+    # sam arguments:
+    parser.add_argument('--model_type', default="vit_h", type=str, help="The type of model to load, in ['default', 'vit_h', 'vit_l', 'vit_b']")
+    parser.add_argument('--sam_checkpoint', default="sam_vit_h_4b8939.pth", type=str, help='The path to the SAM checkpoint to use for mask generation.')
     parser.add_argument("--device", default="cuda:0", type=str, help="The device to run generation on.")
     # arguments for prompt filter:
     parser.add_argument('--pred_iou_thres', type=float, default=0.7, help='Exclude masks with a predicted score from the model that is lower than this threshold.')
@@ -289,7 +296,7 @@ def get_args():
     parser.add_argument('--box_nms_thres', type=float, default=0.8, help='The overlap threshold for excluding a duplicate mask.')
     parser.add_argument('--keep_thres', type=float, default=0.4, help='The keeping threshold for keeping a prompt.')
     # arguments for post-processing floor:
-    parser.add_argument('--post_floor', type=bool, default=False, help='Whether post-processing the floor')
+    parser.add_argument('--post_floor', type=bool, default=True, help='Whether post-processing the floor')
     parser.add_argument('--scene_ht_thres', type=float, default=0.08, help='Height threshold of the floor area proposal')
     parser.add_argument('--scene_inter_thres', type=float, default=0.4, help='Intersection threshold')
     parser.add_argument('--scene_dist_thres', type=float, default=0.01, help='Distance_threshold, like a "thickness" of the floor')   
@@ -299,30 +306,28 @@ def get_args():
 
 if __name__ == "__main__":
     args = get_args()
-    args.prompt_path = args.data_path / "sampro3d_outputs" / "initial_prompt"
-    args.sam_output_path  = args.data_path / "sampro3d_outputs" / "SAM_outputs"
-    args.pred_path = args.data_path / "sampro3d_outputs" / "sampro3d_predictions"
-    args.output_vis_path = args.data_path / "sampro3d_outputs" / "result_visualization"
-    
     print("Arguments:")
     print(args)
 
     # Initialize SAM:
     sys.path.append("..")
     device = torch.device(args.device)
+    sam = sam_model_registry[args.model_type](checkpoint=args.sam_checkpoint)
+    sam.to(device=device)
+    predictor = SamPredictor(sam)
 
     print("Start loading SAM segmentations and other meta data ...")
     # Load the initial 3D input prompts (i.e., fps-sampled input points):
-    prompt_ply_file = os.path.join(args.prompt_path, 'init_prompt.ply')
+    prompt_ply_file = os.path.join(args.prompt_path, args.scene_name + '.ply')
     init_prompt, _ = load_ply(prompt_ply_file)
     print("the number of initial prompts", init_prompt.shape[0])
 
     # Load all 3D points of the input scene:
-    scene_plypath = os.path.join(args.data_path, 'dense_pc.ply')
+    scene_plypath = os.path.join(args.data_path, args.scene_name, args.scene_name + '_sparse.ply')
     xyz, rgb = load_ply(scene_plypath)
 
     # Load SAM segmentations generated by previous 3D Prompt Proposal: 
-    scene_output_path = args.sam_output_path
+    scene_output_path = os.path.join(args.sam_output_path, args.scene_name)
     points_npy_path = natsorted(os.listdir(os.path.join(scene_output_path, 'points_npy')))
     iou_preds_npy_path = natsorted(os.listdir(os.path.join(scene_output_path, 'iou_preds_npy')))
     masks_npy_path = natsorted(os.listdir(os.path.join(scene_output_path, 'masks_npy')))
@@ -333,8 +338,7 @@ if __name__ == "__main__":
 
     # 2D-Guided Prompt Filter:
     print("Start 2D-Guided Prompt Filter ...")
-    mask_threshold = 0.0
-    keep_idx = prompt_filter(init_prompt, scene_output_path, points_npy_path, mask_threshold, args)
+    keep_idx = prompt_filter(init_prompt, scene_output_path, points_npy_path, predictor, args)
     # pt_filtered = pt_init[keep_idx.clone().cpu().numpy()]
     print("Finished 2D-Guided Prompt Filter!")
     print("********************************************************")
@@ -354,7 +358,7 @@ if __name__ == "__main__":
     pt_pred = num_to_natural(pt_pred)
     create_folder(args.pred_path)
     # save the prediction result:
-    pred_file = os.path.join(args.pred_path, 'seg.npy')
+    pred_file = os.path.join(args.pred_path, args.scene_name + '_seg.npy')
     np.save(pred_file, pt_pred)
 
     # Post process for perfect floor segmentation:
@@ -386,6 +390,6 @@ if __name__ == "__main__":
     mesh.vertices = mesh_ori.vertices
     mesh.triangles = mesh_ori.triangles
     mesh.vertex_colors = o3d.utility.Vector3dVector(c)
-    output_vis_file = os.path.join(args.output_vis_path, 'seg.ply')
+    output_vis_file = os.path.join(args.output_vis_path, args.scene_name + '_seg.ply')
     o3d.io.write_triangle_mesh(output_vis_file, mesh)
     print("Successfully save the visualization result of final segmentation!")

@@ -26,12 +26,12 @@ def create_output_folders(args):
     # Create folder to save SAM outputs:
     create_folder(args.sam_output_path)
     # Create folder to save SAM outputs for a specific scene:
-    create_folder(os.path.join(args.sam_output_path, args.scene_name))
+    create_folder(os.path.join(args.sam_output_path))
     # Create subfolder for saving different output types:
-    create_folder(os.path.join(args.sam_output_path, args.scene_name, 'points_npy'))
-    create_folder(os.path.join(args.sam_output_path, args.scene_name, 'iou_preds_npy'))
-    create_folder(os.path.join(args.sam_output_path, args.scene_name, 'masks_npy'))
-    create_folder(os.path.join(args.sam_output_path, args.scene_name, 'corre_3d_ins_npy'))
+    create_folder(os.path.join(args.sam_output_path, 'points_npy'))
+    create_folder(os.path.join(args.sam_output_path, 'iou_preds_npy'))
+    create_folder(os.path.join(args.sam_output_path, 'masks_npy'))
+    create_folder(os.path.join(args.sam_output_path, 'corre_3d_ins_npy'))
 
 
 def prompt_init(xyz, rgb, voxel_size, device):
@@ -61,7 +61,7 @@ def save_init_prompt(xyz, rgb, args):
     point_cloud = o3d.geometry.PointCloud()
     point_cloud.points = o3d.utility.Vector3dVector(xyz.cpu().numpy())
     point_cloud.colors = o3d.utility.Vector3dVector(rgb.cpu().numpy())
-    prompt_ply_file = os.path.join(args.prompt_path, args.scene_name + '.ply')
+    prompt_ply_file = os.path.join(args.prompt_path, 'init_prompt.ply')
     o3d.io.write_point_cloud(prompt_ply_file, point_cloud)
     
     
@@ -104,20 +104,26 @@ def generate_sam_gt_output(transforms, frame_id_init, frame_id_end, init_prompt,
     for i in trange(frame_id_init, frame_id_end):
         frame_id = i
         frame_name = "frame_{:05d}".format(frame_id + 1)
-        image = cv2.imread(args.data_path / 'images' / str(frame_name) + '.png')
+        
+        image_dir = args.data_path / 'images' / f"{frame_name}.png"
+        image = cv2.imread(image_dir.as_posix())
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         # Load the intrinsic
         depth_intrinsic = torch.eye(4, dtype=torch.float64).to(device=args.device)
-        depth_intrinsic[0, 0] = transforms["frames"][i]["fl_x"]
-        depth_intrinsic[1, 1] = transforms["frames"][i]["fl_y"]
-        depth_intrinsic[0, 2] = transforms["frames"][i]["cx"]
-        depth_intrinsic[1, 2] = transforms["frames"][i]["cy"]
+        depth_intrinsic[0, 0] = transforms["fl_x"]
+        depth_intrinsic[1, 1] = transforms["fl_y"]
+        depth_intrinsic[0, 2] = transforms["cx"]
+        depth_intrinsic[1, 2] = transforms["cy"]
         # Load the depth, and pose
-        depth = cv2.imread(args.data_path / 'depth' / str(frame_name) + '.tif', -1)
+        depth_dir = args.data_path / 'depth' / f"{frame_name}.tif"
+        depth = cv2.imread(depth_dir.as_posix(), -1)
         depth = torch.from_numpy(depth.astype(np.float64)).to(device=args.device)
-        pose = torch.tensor(transforms["frames"][i]["transform_matrix"]), dtype=torch.float64).to(device=args.device)
-        mask = torch.from_numpy(np.array(Image.open(args.data_path / 'instance' / str(frame_name) + '.png'))).to(device=args.device)
-        
+        pose = torch.tensor(transforms["frames"][i]["transform_matrix"], dtype=torch.float64).to(device=args.device)
+        mask_dir = args.data_path / 'instance' / f"{frame_name}.png"
+        mask = torch.from_numpy(np.array(Image.open(mask_dir.as_posix()))).to(device=args.device)
+        # print(pose)
+        # print(depth.max())
+        # exit()
         if str(pose[0, 0].item()) == '-inf': # skip frame with '-inf' pose
             print(f'skip frame {frame_id}')
             continue
@@ -140,47 +146,6 @@ def generate_sam_gt_output(transforms, frame_id_init, frame_id_end, init_prompt,
         np.save(args.sam_output_path / "masks_npy" / save_file_name, data_original["masks"])  
         np.save(args.sam_output_path / "iou_preds_npy" / save_file_name, data_original["iou_preds"])  
         np.save(args.sam_output_path / "corre_3d_ins_npy" / save_file_name, data_original["corre_3d_ins"])
-
-def sam_seg(predictor, frame_id_init, frame_id_end, init_prompt, args):
-    for i in trange(frame_id_init, frame_id_end):
-        frame_id = i
-        frame_name = "frame_{:05d}".format(frame_id + 1)
-        image = cv2.imread(os.path.join(args.data_path, args.scene_name, 'images', str(frame_name) + '.png'))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        # Load the intrinsic
-        depth_intrinsic = torch.tensor(np.loadtxt(os.path.join(args.data_path, 'intrinsics.txt')), dtype=torch.float64).to(device=predictor.device)
-        # Load the depth, and pose
-        depth = cv2.imread(os.path.join(args.data_path, args.scene_name, 'depth', str(frame_name) + '.tif'), -1) # read 16bit grayscale 
-        depth = torch.from_numpy(depth.astype(np.float64)).to(device=predictor.device)
-        pose = torch.tensor(np.loadtxt(os.path.join(args.data_path, args.scene_name, 'pose', str(frame_name) + '.txt')), dtype=torch.float64).to(device=predictor.device)
-        
-        if str(pose[0, 0].item()) == '-inf': # skip frame with '-inf' pose
-            print(f'skip frame {frame_id}')
-            continue
-
-        # 3D-2D projection
-        input_point_pos, corre_ins_idx = transform_pt_depth_scannet_torch(init_prompt, depth_intrinsic, depth, pose, predictor.device)  # [valid, 2], [valid]
-        if input_point_pos.shape[0] == 0 or input_point_pos.shape[1] == 0:
-            print(f'skip frame {frame_id}')
-            continue
-
-        image_size = image.shape[:2]
-        predictor.set_image(image)
-        # SAM segmetaion on image
-        data_original = MaskData()
-        for (points, ins_idxs) in batch_iterator(64, input_point_pos, corre_ins_idx):
-            batch_data_original = process_batch(predictor, points, ins_idxs, image_size)
-            data_original.cat(batch_data_original)
-            del batch_data_original
-        predictor.reset_image()
-        data_original.to_numpy()
-
-        save_file_name = str(frame_id) + ".npy"
-        np.save(os.path.join(args.sam_output_path, args.scene_name, "points_npy", save_file_name), data_original["points"])
-        np.save(os.path.join(args.sam_output_path, args.scene_name, "masks_npy", save_file_name), data_original["masks"])  
-        np.save(os.path.join(args.sam_output_path, args.scene_name, "iou_preds_npy", save_file_name), data_original["iou_preds"])  
-        np.save(os.path.join(args.sam_output_path, args.scene_name, "corre_3d_ins_npy", save_file_name), data_original["corre_3d_ins"])
-
 
 def get_args():
     parser = argparse.ArgumentParser(
@@ -217,7 +182,7 @@ if __name__ == "__main__":
     create_output_folders(args)  # we use npy files to save different output types for faster i/o and clear split
     # perform SAM on each 2D RGB frame:
     frame_id_init = 0
-    with open(args.data_path / "transform_matrix.json") as f:
+    with open(args.data_path / "transforms.json") as f:
         transforms = json.load(f)
     frame_id_end = len(transforms["frames"])
     # You can define frame_id_init and frame_id_end by yourself for segmenting partial point clouds from limited frames. Sometimes partial result is better!

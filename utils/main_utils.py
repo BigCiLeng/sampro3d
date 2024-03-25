@@ -4,7 +4,7 @@ import os
 import plyfile
 import cv2
 import copy
-
+import json
 """
 main functions
 """
@@ -14,7 +14,7 @@ def load_ply(ply_path):
     data = ply_data['vertex']
 
     data = np.concatenate([data['x'].reshape(1, -1), data['y'].reshape(1, -1), data['z'].reshape(1, -1), \
-                        data['red'].reshape(1, -1), data['green'].reshape(1, -1), data['blue'].reshape(1, -1)], axis=0)
+                        data['red'].reshape(1, -1), data['green'].reshape(1, -1), data['blue'].reshape(1, -1)], axis=0, dtype=np.float32)
 
     xyz = data.T[:, :3]
     rgb = data.T[:, 3:]
@@ -24,7 +24,7 @@ def load_ply(ply_path):
 
 def create_folder(folder_path):
     if not os.path.exists(folder_path):
-        os.mkdir(folder_path)
+        os.makedirs(folder_path)
         print(f'Folder created at "{folder_path}"')
     else:
         print(f'Folder already exists at "{folder_path}"')
@@ -49,8 +49,19 @@ def transform_pt_depth_scannet_torch(points, depth_intrinsic, depth, pose, devic
     by = depth_intrinsic[1,3]
     
     points_world = torch.cat([points, torch.ones((points.shape[0], 1), dtype=torch.float64).to(device)], dim=-1).to(torch.float64)
-    world_to_camera = torch.inverse(pose)
-    
+    # world_to_camera = torch.inverse(pose)
+    R = pose[:3, :3]  # 3 x 3
+    T = pose[:3, 3:4]  # 3 x 1
+    # flip the z and y axes to align with gsplat conventions
+    R_edit = torch.diag(torch.tensor([1, -1, -1], device=device, dtype=R.dtype))
+    R = R @ R_edit
+    # analytic matrix inverse to get world2camera matrix
+    R_inv = R.T
+    T_inv = -R_inv @ T
+    world_to_camera = torch.eye(4, device=device, dtype=R.dtype)
+    world_to_camera[:3, :3] = R_inv
+    world_to_camera[:3, 3:4] = T_inv
+        
     p = torch.matmul(world_to_camera, points_world.T)  # [Xb, Yb, Zb, 1]: 4, n
     p[0] = ((p[0] - bx) * fx) / p[2] + cx 
     p[1] = ((p[1] - by) * fy) / p[2] + cy
@@ -79,36 +90,48 @@ def transform_pt_depth_scannet_torch(points, depth_intrinsic, depth, pose, devic
     return p, keep_idx
 
 
-def compute_mapping(points, data_path, scene_name, frame_id):  
+def compute_mapping(points, data_path, frame_id):  
     """
     :param points: N x 3 format
     :param depth: H x W format
     :param intrinsic: 3x3 format
     :return: mapping, N x 3 format, (H,W,mask)
     """
-    frame_id = "frame_{:05d}".format(int(frame_id) + 1)
+    frame_name = "frame_{:05d}".format(int(frame_id) + 1)
     
     vis_thres = 0.1
     depth_shift = 1000.0
 
     mapping = np.zeros((3, points.shape[0]), dtype=int)
-    
-    # Load the intrinsic matrix
-    depth_intrinsic = np.loadtxt(os.path.join(data_path, 'intrinsics.txt'))
-    
-    # Load the depth image, and camera pose
-    depth = cv2.imread(os.path.join(data_path, scene_name, 'depth', frame_id + '.tif'), -1) # read 16bit grayscale 
-    pose = np.loadtxt(os.path.join(data_path, scene_name, 'pose', frame_id + '.txt' ))
+    with open(data_path / "transforms.json") as f:
+        transforms = json.load(f)
 
-    fx = depth_intrinsic[0,0]
-    fy = depth_intrinsic[1,1]
-    cx = depth_intrinsic[0,2]
-    cy = depth_intrinsic[1,2]
-    bx = depth_intrinsic[0,3]
-    by = depth_intrinsic[1,3]
+    # Load the depth, and pose
+    depth_dir = data_path / 'depth' / f"{frame_name}.tif"
+    depth = cv2.imread(depth_dir.as_posix(), -1)
+    pose = np.array(transforms["frames"][int(frame_id)]["transform_matrix"], dtype=np.float32)
+
+    fx = transforms["fl_x"]
+    fy = transforms["fl_y"]
+    cx = transforms["cx"]
+    cy = transforms["cy"]
+    bx = transforms["bx"] if "bx" in transforms else 0.
+    by = transforms["by"] if "bx" in transforms else 0.
     
     points_world = np.concatenate([points, np.ones([points.shape[0], 1])], axis=1)
-    world_to_camera = np.linalg.inv(pose)
+    # world_to_camera = np.linalg.inv(pose)
+    R = pose[:3, :3]  # 3 x 3
+    T = pose[:3, 3:4]  # 3 x 1
+    # flip the z and y axes to align with gsplat conventions
+    R_edit = np.diag(np.array([1, -1, -1], dtype=R.dtype))
+    R = R @ R_edit
+    # analytic matrix inverse to get world2camera matrix
+    R_inv = R.T
+    T_inv = -R_inv @ T
+    world_to_camera = np.eye(4, dtype=R.dtype)
+    world_to_camera[:3, :3] = R_inv
+    world_to_camera[:3, 3:4] = T_inv
+
     p = np.matmul(world_to_camera, points_world.T)  # [Xb, Yb, Zb, 1]: 4, n
     p[0] = ((p[0] - bx) * fx) / p[2] + cx 
     p[1] = ((p[1] - by) * fy) / p[2] + cy
